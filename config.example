@@ -1,0 +1,41 @@
+# watch-cli Configuration File
+# Copy this file to ~/.config/watch-cli/config to customize settings
+
+# Media Player Configuration
+# Options: mpv, vlc
+WATCH_CLI_PLAYER="mpv"
+
+# Quality Preferences
+# Options: 360p, 480p, 720p, 1080p
+WATCH_CLI_QUALITY="720p"
+
+# Language Preferences
+# Options: en, jp, es, fr, de, etc.
+WATCH_CLI_LANGUAGE="en"
+
+# Torrent Streaming
+# Set to false to disable peerflix/torrent streaming
+ENABLE_TORRENT="true"
+
+# Provider Preferences
+# You can disable specific providers by setting them to false
+ENABLE_ALLANIME="true"
+ENABLE_INTERNET_ARCHIVE="true"
+ENABLE_GOKU="true"
+ENABLE_PEERFLIX="true"
+
+# Cache Settings
+# Cache directory for temporary files
+CACHE_DIR="${HOME}/.config/watch-cli/cache"
+
+# Logging
+# Enable/disable logging
+ENABLE_LOGGING="true"
+LOG_LEVEL="INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# Player-specific settings
+# MPV settings
+MPV_OPTS="--really-quiet --no-terminal"
+
+# VLC settings
+VLC_OPTS="--intf dummy --play-and-exit"

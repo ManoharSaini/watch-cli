@@ -1,0 +1,778 @@
+#!/bin/bash
+
+# watch-cli - A robust, modular command-line tool for streaming anime, movies, and TV shows
+# Author: AI Assistant
+# Version: 1.0.0
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="${HOME}/.config/watch-cli"
+CACHE_DIR="${CONFIG_DIR}/cache"
+LOG_FILE="${CONFIG_DIR}/watch-cli.log"
+
+# Default configuration
+DEFAULT_PLAYER="mpv"
+DEFAULT_QUALITY="720p"
+DEFAULT_LANGUAGE="en"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Logging function with injection protection
+log() {
+    # Sanitize input to prevent log injection
+    local sanitized_msg
+    sanitized_msg=$(printf '%s\n' "$1" | sed 's/[[:cntrl:]]//g' | tr -d '\n\r')
+    
+    # Ensure log file directory exists
+    mkdir -p "$(dirname "$LOG_FILE")"
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $sanitized_msg" >> "$LOG_FILE"
+}
+
+# Print colored output
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+    log "INFO: $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    log "SUCCESS: $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+    log "WARNING: $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+    log "ERROR: $1"
+}
+
+# Check if a command exists and is functional
+# Args: $1 - command name to check
+# Returns: 0 if command exists and works, 1 otherwise
+command_exists() {
+    local cmd="$1"
+    
+    # Check if command exists
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # For critical commands, verify they actually work
+    case "$cmd" in
+        "curl")
+            # Test curl with a simple request
+            if ! curl --version >/dev/null 2>&1; then
+                return 1
+            fi
+            ;;
+        "jq")
+            # Test jq with a simple JSON
+            if ! echo '{"test": "value"}' | jq . >/dev/null 2>&1; then
+                return 1
+            fi
+            ;;
+        "fzf")
+            # Test fzf with a simple input
+            if ! echo "test" | fzf --filter "test" >/dev/null 2>&1; then
+                return 1
+            fi
+            ;;
+        "mpv"|"vlc")
+            # Test media player with help flag
+            if ! "$cmd" --help >/dev/null 2>&1; then
+                return 1
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+# Check dependencies
+# Validates that all required dependencies are installed and functional
+# Exits with error code 1 if critical dependencies are missing
+check_dependencies() {
+    local missing_deps=()
+    
+    # Required dependencies
+    local required_deps=("curl" "fzf" "jq")
+    
+    for dep in "${required_deps[@]}"; do
+        if ! command_exists "$dep"; then
+            missing_deps+=("$dep")
+        fi
+    done
+    
+    # Check for media player
+    local player_found=false
+    if command_exists "mpv"; then
+        player_found=true
+        PLAYER="mpv"
+    elif command_exists "vlc"; then
+        player_found=true
+        PLAYER="vlc"
+    fi
+    
+    if [[ "$player_found" == false ]]; then
+        missing_deps+=("mpv or vlc")
+    fi
+    
+    # Check for peerflix if torrent streaming is enabled
+    if [[ "${ENABLE_TORRENT:-true}" == "true" ]]; then
+        if ! command_exists "node"; then
+            missing_deps+=("node (for peerflix)")
+        elif ! command_exists "peerflix"; then
+            print_warning "peerflix not found. Install with: npm install -g peerflix"
+        fi
+    fi
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        print_error "Missing required dependencies:"
+        for dep in "${missing_deps[@]}"; do
+            echo "  - $dep"
+        done
+        echo ""
+        echo "Please install the missing dependencies and try again."
+        exit 1
+    fi
+    
+    print_success "All dependencies found"
+}
+
+# Initialize configuration
+init_config() {
+    # Create directories with error handling and race condition protection
+    if ! mkdir -p "$CONFIG_DIR" 2>/dev/null; then
+        # Check if directory was created by another process
+        if [[ ! -d "$CONFIG_DIR" ]]; then
+            print_error "Failed to create config directory: $CONFIG_DIR"
+            exit 1
+        fi
+    fi
+    
+    if ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
+        # Check if directory was created by another process
+        if [[ ! -d "$CACHE_DIR" ]]; then
+            print_error "Failed to create cache directory: $CACHE_DIR"
+            exit 1
+        fi
+    fi
+    
+    # Load user configuration with security validation
+    if [[ -f "${CONFIG_DIR}/config" ]]; then
+        # Validate config file is readable and safe
+        if [[ ! -r "${CONFIG_DIR}/config" ]]; then
+            print_warning "Config file exists but is not readable: ${CONFIG_DIR}/config"
+        else
+            # Validate config file doesn't contain dangerous commands
+            if grep -qE '(exec|eval|system|command|`|\$\(|source|\.)' "${CONFIG_DIR}/config" 2>/dev/null; then
+                print_warning "Config file contains potentially dangerous commands, skipping"
+            else
+                # Source config with error handling in a restricted environment
+                (
+                    # Create a safe environment for config loading
+                    unset -f exec eval system command
+                    if ! source "${CONFIG_DIR}/config" 2>/dev/null; then
+                        print_warning "Failed to load config file, using defaults"
+                    fi
+                )
+            fi
+        fi
+    fi
+    
+    # Set player from environment or config with validation
+    PLAYER="${WATCH_CLI_PLAYER:-${PLAYER:-$DEFAULT_PLAYER}}"
+    QUALITY="${WATCH_CLI_QUALITY:-$DEFAULT_QUALITY}"
+    LANGUAGE="${WATCH_CLI_LANGUAGE:-$DEFAULT_LANGUAGE}"
+    
+    # Validate player choice
+    case "$PLAYER" in
+        "mpv"|"vlc")
+            # Valid player
+            ;;
+        *)
+            print_warning "Invalid player '$PLAYER', defaulting to '$DEFAULT_PLAYER'"
+            PLAYER="$DEFAULT_PLAYER"
+            ;;
+    esac
+    
+    # Validate quality
+    case "$QUALITY" in
+        "360p"|"480p"|"720p"|"1080p")
+            # Valid quality
+            ;;
+        *)
+            print_warning "Invalid quality '$QUALITY', defaulting to '$DEFAULT_QUALITY'"
+            QUALITY="$DEFAULT_QUALITY"
+            ;;
+    esac
+    
+    # Validate language (basic check)
+    if [[ ! "$LANGUAGE" =~ ^[a-z]{2}$ ]]; then
+        print_warning "Invalid language format '$LANGUAGE', defaulting to '$DEFAULT_LANGUAGE'"
+        LANGUAGE="$DEFAULT_LANGUAGE"
+    fi
+    
+    print_info "Using player: $PLAYER"
+    print_info "Quality preference: $QUALITY"
+    print_info "Language preference: $LANGUAGE"
+}
+
+# Display help
+show_help() {
+    cat << EOF
+watch-cli - Stream anime, movies, and TV shows from the command line
+
+USAGE:
+    watch-cli [OPTIONS]
+
+OPTIONS:
+    -h, --help          Show this help message
+    -v, --version       Show version information
+    --anime             Skip media type selection and go directly to anime
+    --movie             Skip media type selection and go directly to movies
+    --tv                Skip media type selection and go directly to TV shows
+    --no-torrent        Disable torrent streaming (peerflix)
+    --quality QUALITY   Set preferred quality (360p, 480p, 720p, 1080p)
+    --language LANG     Set preferred language (en, jp, etc.)
+
+ENVIRONMENT VARIABLES:
+    WATCH_CLI_PLAYER    Media player to use (mpv, vlc)
+    WATCH_CLI_QUALITY   Default quality preference
+    WATCH_CLI_LANGUAGE  Default language preference
+
+EXAMPLES:
+    watch-cli
+    watch-cli --anime
+    watch-cli --movie --quality 1080p
+    WATCH_CLI_PLAYER=vlc watch-cli
+
+EOF
+}
+
+# Display version
+show_version() {
+    echo "watch-cli v1.0.0"
+    echo "A robust, modular command-line tool for streaming anime, movies, and TV shows"
+}
+
+# Media type selection
+select_media_type() {
+    if [[ -n "${MEDIA_TYPE:-}" ]]; then
+        return 0
+    fi
+    
+    print_info "Select media type:"
+    local choice
+    choice=$(echo -e "Anime\nMovie\nTV Show" | fzf --prompt="Choose media type: " --height=10)
+    
+    case "$choice" in
+        "Anime")
+            MEDIA_TYPE="anime"
+            ;;
+        "Movie")
+            MEDIA_TYPE="movie"
+            ;;
+        "TV Show")
+            MEDIA_TYPE="tv"
+            ;;
+        *)
+            print_error "Invalid selection"
+            exit 1
+            ;;
+    esac
+    
+    print_success "Selected: $MEDIA_TYPE"
+}
+
+# Search for content
+search_content() {
+    local query
+    
+    # Get user input with validation
+    while true; do
+        read -p "Enter search query: " query
+        
+        # Trim whitespace efficiently
+        query="${query#"${query%%[![:space:]]*}"}"  # Remove leading whitespace
+        query="${query%"${query##*[![:space:]]}"}"  # Remove trailing whitespace
+        
+        if [[ -z "$query" ]]; then
+            print_error "Search query cannot be empty"
+            continue
+        fi
+        
+        # Check for reasonable length
+        if [[ ${#query} -gt 100 ]]; then
+            print_error "Search query too long (max 100 characters)"
+            continue
+        fi
+        
+        # Check for dangerous characters that could cause command injection
+        if [[ "$query" == *";"* ]] || [[ "$query" == *"&"* ]] || [[ "$query" == *"|"* ]] || [[ "$query" == *"\`"* ]] || [[ "$query" == *"\$("* ]]; then
+            print_error "Search query contains potentially dangerous characters"
+            continue
+        fi
+        
+        # Allow $ but not $(command) patterns
+        if [[ "$query" =~ \$\{.*\} ]]; then
+            print_error "Search query contains variable expansion patterns"
+            continue
+        fi
+        
+        break
+    done
+    
+    SEARCH_QUERY="$query"
+    print_info "Searching for: $query"
+}
+
+# Provider system - this will be implemented by individual provider scripts
+query_providers() {
+    local media_type="$1"
+    local query="$2"
+    local results_file="${CACHE_DIR}/search_results.json"
+    
+    # Clear previous results
+    > "$results_file"
+    
+    case "$media_type" in
+        "anime")
+            # Query anime providers in order
+            if [[ -f "${SCRIPT_DIR}/providers/allanime.sh" ]]; then
+                print_info "Querying AllAnime..."
+                "${SCRIPT_DIR}/providers/allanime.sh" search "$query" >> "$results_file"
+            fi
+            ;;
+        "movie"|"tv")
+            # Query movie/TV providers in order
+            if [[ -f "${SCRIPT_DIR}/providers/internet_archive.sh" ]]; then
+                print_info "Querying Internet Archive..."
+                "${SCRIPT_DIR}/providers/internet_archive.sh" search "$query" "$media_type" >> "$results_file"
+            fi
+            
+            if [[ -f "${SCRIPT_DIR}/providers/goku.sh" ]]; then
+                print_info "Querying Goku.to..."
+                "${SCRIPT_DIR}/providers/goku.sh" search "$query" "$media_type" >> "$results_file"
+            fi
+            
+            if [[ "${ENABLE_TORRENT:-true}" == "true" ]] && [[ -f "${SCRIPT_DIR}/providers/peerflix.sh" ]]; then
+                print_info "Querying torrent sources..."
+                "${SCRIPT_DIR}/providers/peerflix.sh" search "$query" "$media_type" >> "$results_file"
+            fi
+            ;;
+    esac
+    
+    # Check if we got any results
+    if [[ ! -s "$results_file" ]]; then
+        print_error "No results found for query: $query"
+        exit 1
+    fi
+}
+
+# Display search results and let user select
+select_content() {
+    local results_file="${CACHE_DIR}/search_results.json"
+    
+    # Check if results file exists and has content
+    if [[ ! -f "$results_file" ]] || [[ ! -s "$results_file" ]]; then
+        print_error "No results file found or empty"
+        exit 1
+    fi
+    
+    # Parse and format results for fzf with proper error handling
+    local formatted_results
+    
+    # Validate JSON first
+    if ! jq empty "$results_file" 2>/dev/null; then
+        print_error "Invalid JSON in results file"
+        exit 1
+    fi
+    
+    if ! formatted_results=$(jq -r '.[] | "\(.title) (\(.year // "Unknown")) - \(.provider)"' "$results_file" 2>/dev/null); then
+        print_error "Failed to parse results file"
+        exit 1
+    fi
+    
+    if [[ -z "$formatted_results" ]]; then
+        print_error "No results to display"
+        exit 1
+    fi
+    
+    # Let user select content
+    local selected
+    if ! selected=$(echo "$formatted_results" | fzf --prompt="Select content: " --height=20); then
+        print_error "No content selected or fzf failed"
+        exit 1
+    fi
+    
+    if [[ -z "$selected" ]]; then
+        print_error "No content selected"
+        exit 1
+    fi
+    
+    # Extract the selected item from results - more robust parsing
+    local title
+    title="${selected%% - *}"  # Remove everything after " - "
+    title="${title#"${title%%[![:space:]]*}"}"  # Remove leading whitespace
+    title="${title%"${title##*[![:space:]]}"}"  # Remove trailing whitespace
+    
+    # Find the corresponding result in JSON with proper escaping
+    local escaped_title
+    escaped_title=$(printf '%s\n' "$title" | jq -R .)
+    
+    if ! SELECTED_CONTENT=$(jq -r ".[] | select(.title == $escaped_title)" "$results_file" 2>/dev/null); then
+        print_error "Could not find selected content details"
+        exit 1
+    fi
+    
+    if [[ -z "$SELECTED_CONTENT" ]] || [[ "$SELECTED_CONTENT" == "null" ]]; then
+        print_error "Selected content not found in results"
+        exit 1
+    fi
+    
+    print_success "Selected: $(echo "$SELECTED_CONTENT" | jq -r '.title')"
+}
+
+# Handle episode selection for anime and TV shows
+select_episode() {
+    local content="$1"
+    local media_type="$2"
+    
+    if [[ "$media_type" == "movie" ]]; then
+        # Movies don't need episode selection
+        return 0
+    fi
+    
+    local provider
+    provider=$(echo "$content" | jq -r '.provider')
+    local content_id
+    content_id=$(echo "$content" | jq -r '.id')
+    
+    print_info "Loading episodes..."
+    
+    # Query provider for episodes with proper error handling
+    local episodes_file="${CACHE_DIR}/episodes.json"
+    local provider_script=""
+    
+    case "$provider" in
+        "allanime")
+            provider_script="${SCRIPT_DIR}/providers/allanime.sh"
+            ;;
+        "internet_archive")
+            provider_script="${SCRIPT_DIR}/providers/internet_archive.sh"
+            ;;
+        "goku")
+            provider_script="${SCRIPT_DIR}/providers/goku.sh"
+            ;;
+        "peerflix")
+            provider_script="${SCRIPT_DIR}/providers/peerflix.sh"
+            ;;
+        *)
+            print_error "Unknown provider: $provider"
+            exit 1
+            ;;
+    esac
+    
+    if [[ ! -f "$provider_script" ]]; then
+        print_error "Provider script not found: $provider_script"
+        exit 1
+    fi
+    
+    if [[ ! -x "$provider_script" ]]; then
+        print_error "Provider script not executable: $provider_script"
+        exit 1
+    fi
+    
+    # Call provider script with error handling
+    if ! "$provider_script" episodes "$content_id" > "$episodes_file" 2>/dev/null; then
+        print_error "Provider script failed: $provider_script"
+        exit 1
+    fi
+    
+    if [[ ! -f "$episodes_file" ]] || [[ ! -s "$episodes_file" ]]; then
+        print_error "Could not load episodes"
+        exit 1
+    fi
+    
+    # Display episodes for selection with proper error handling
+    local episode_list
+    if ! episode_list=$(jq -r '.[] | "Episode \(.episode // .number): \(.title // "Episode \(.episode // .number)")"' "$episodes_file" 2>/dev/null); then
+        print_error "Failed to parse episodes file"
+        exit 1
+    fi
+    
+    if [[ -z "$episode_list" ]]; then
+        print_error "No episodes found"
+        exit 1
+    fi
+    
+    local selected_episode
+    if ! selected_episode=$(echo "$episode_list" | fzf --prompt="Select episode: " --height=15); then
+        print_error "No episode selected or fzf failed"
+        exit 1
+    fi
+    
+    if [[ -z "$selected_episode" ]]; then
+        print_error "No episode selected"
+        exit 1
+    fi
+    
+    # Extract episode number with better regex
+    local episode_num
+    if ! episode_num=$(echo "$selected_episode" | sed -n 's/Episode \([0-9]*\):.*/\1/p'); then
+        print_error "Could not extract episode number"
+        exit 1
+    fi
+    
+    if [[ -z "$episode_num" ]]; then
+        print_error "Invalid episode number extracted"
+        exit 1
+    fi
+    
+    # Find episode details with proper validation
+    if ! SELECTED_EPISODE=$(jq -r ".[] | select(.episode == $episode_num or .number == $episode_num)" "$episodes_file" 2>/dev/null); then
+        print_error "Could not find episode details"
+        exit 1
+    fi
+    
+    if [[ -z "$SELECTED_EPISODE" ]] || [[ "$SELECTED_EPISODE" == "null" ]]; then
+        print_error "Selected episode not found"
+        exit 1
+    fi
+    
+    print_success "Selected: $selected_episode"
+}
+
+# Get stream URL and play
+play_content() {
+    local content="$1"
+    local episode="$2"
+    local media_type="$3"
+    
+    local provider
+    provider=$(echo "$content" | jq -r '.provider')
+    local content_id
+    content_id=$(echo "$content" | jq -r '.id')
+    
+    print_info "Resolving stream URL..."
+    
+    # Get stream URL from provider with proper error handling
+    local stream_url
+    local headers_file="${CACHE_DIR}/headers.txt"
+    local provider_script=""
+    local episode_num
+    
+    # Extract episode number safely
+    if ! episode_num=$(echo "$episode" | jq -r '.episode // .number' 2>/dev/null); then
+        print_error "Could not extract episode number"
+        exit 1
+    fi
+    
+    if [[ -z "$episode_num" ]] || [[ "$episode_num" == "null" ]]; then
+        print_error "Invalid episode number"
+        exit 1
+    fi
+    
+    # Determine provider script
+    case "$provider" in
+        "allanime")
+            provider_script="${SCRIPT_DIR}/providers/allanime.sh"
+            ;;
+        "internet_archive")
+            provider_script="${SCRIPT_DIR}/providers/internet_archive.sh"
+            ;;
+        "goku")
+            provider_script="${SCRIPT_DIR}/providers/goku.sh"
+            ;;
+        "peerflix")
+            provider_script="${SCRIPT_DIR}/providers/peerflix.sh"
+            ;;
+        *)
+            print_error "Unknown provider: $provider"
+            exit 1
+            ;;
+    esac
+    
+    # Validate provider script
+    if [[ ! -f "$provider_script" ]]; then
+        print_error "Provider script not found: $provider_script"
+        exit 1
+    fi
+    
+    if [[ ! -x "$provider_script" ]]; then
+        print_error "Provider script not executable: $provider_script"
+        exit 1
+    fi
+    
+    # Call provider script to get stream URL
+    if ! stream_url=$("$provider_script" stream "$content_id" "$episode_num" 2>/dev/null); then
+        print_error "Provider script failed to get stream URL"
+        exit 1
+    fi
+    
+    if [[ -z "$stream_url" ]]; then
+        print_error "Could not resolve stream URL"
+        exit 1
+    fi
+    
+    # Validate stream URL format
+    if [[ ! "$stream_url" =~ ^https?:// ]]; then
+        print_error "Invalid stream URL format: $stream_url"
+        exit 1
+    fi
+    
+    print_success "Stream URL resolved"
+    print_info "Starting playback with $PLAYER..."
+    
+    # Prepare player command with security validation
+    local player_cmd=()
+    
+    # Validate player choice
+    case "$PLAYER" in
+        "mpv"|"vlc")
+            # Valid player
+            ;;
+        *)
+            print_error "Invalid player: $PLAYER. Must be 'mpv' or 'vlc'"
+            exit 1
+            ;;
+    esac
+    
+    # Validate stream URL for security (allow legitimate URL characters)
+    if [[ "$stream_url" == *";"* ]] || [[ "$stream_url" == *"&"* ]] || [[ "$stream_url" == *"|"* ]] || [[ "$stream_url" == *"\`"* ]] || [[ "$stream_url" == *"\$("* ]]; then
+        print_error "Stream URL contains potentially dangerous characters"
+        exit 1
+    fi
+    
+    # Allow $ but not $(command) patterns
+    if [[ "$stream_url" =~ \$\{.*\} ]]; then
+        print_error "Stream URL contains variable expansion patterns"
+        exit 1
+    fi
+    
+    case "$PLAYER" in
+        "mpv")
+            player_cmd=("mpv" "--really-quiet" "--no-terminal")
+            
+            # Add headers if needed with validation
+            if [[ -f "$headers_file" ]]; then
+                while IFS= read -r header; do
+                    # Validate header format
+                    if [[ "$header" =~ ^[A-Za-z0-9_-]+:[[:space:]]*[^[:cntrl:]]*$ ]]; then
+                        player_cmd+=("--http-header-fields=$header")
+                    else
+                        print_warning "Skipping invalid header: $header"
+                    fi
+                done < "$headers_file"
+            fi
+            
+            player_cmd+=("$stream_url")
+            ;;
+        "vlc")
+            player_cmd=("vlc" "--intf" "dummy" "--play-and-exit")
+            
+            # Add headers if needed with validation
+            if [[ -f "$headers_file" ]]; then
+                local vlc_headers=""
+                while IFS= read -r header; do
+                    # Validate header format
+                    if [[ "$header" =~ ^[A-Za-z0-9_-]+:[[:space:]]*[^[:cntrl:]]*$ ]]; then
+                        vlc_headers="${vlc_headers}${header};"
+                    else
+                        print_warning "Skipping invalid header: $header"
+                    fi
+                done < "$headers_file"
+                if [[ -n "$vlc_headers" ]]; then
+                    player_cmd+=("--http-referrer=${vlc_headers%?}")
+                fi
+            fi
+            
+            player_cmd+=("$stream_url")
+            ;;
+    esac
+    
+    # Validate command array
+    if [[ ${#player_cmd[@]} -lt 2 ]]; then
+        print_error "Invalid player command constructed"
+        exit 1
+    fi
+    
+    # Execute player (exec replaces current process, so no return)
+    print_info "Launching player: ${player_cmd[*]}"
+    exec "${player_cmd[@]}"
+}
+
+# Main function
+main() {
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--version)
+                show_version
+                exit 0
+                ;;
+            --anime)
+                MEDIA_TYPE="anime"
+                shift
+                ;;
+            --movie)
+                MEDIA_TYPE="movie"
+                shift
+                ;;
+            --tv)
+                MEDIA_TYPE="tv"
+                shift
+                ;;
+            --no-torrent)
+                ENABLE_TORRENT="false"
+                shift
+                ;;
+            --quality)
+                QUALITY="$2"
+                shift 2
+                ;;
+            --language)
+                LANGUAGE="$2"
+                shift 2
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Initialize
+    init_config
+    check_dependencies
+    
+    # Main workflow
+    select_media_type
+    search_content
+    query_providers "$MEDIA_TYPE" "$SEARCH_QUERY"
+    select_content
+    select_episode "$SELECTED_CONTENT" "$MEDIA_TYPE"
+    play_content "$SELECTED_CONTENT" "$SELECTED_EPISODE" "$MEDIA_TYPE"
+}
+
+# Run main function
+main "$@"
