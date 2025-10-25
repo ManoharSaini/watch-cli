@@ -57,7 +57,7 @@ make_graphql_request() {
     fi
     
     local response
-    if ! response=$(curl -s --max-time 30 --connect-timeout 10 \
+    if ! response=$(curl -sS -f --max-time 30 --connect-timeout 10 \
         -H "Content-Type: application/json" \
         -H "User-Agent: $USER_AGENT" \
         -H "Referer: https://allanime.co/" \
@@ -121,36 +121,44 @@ search_anime() {
             }
         }
     }'
-    
-    local variables="{\"search\":{\"allowAdult\":true,\"allowUnknown\":true,\"query\":\"$query\"}}"
+
+    local variables
+    variables=$(jq -n --arg q "$query" '{search:{allowAdult:true, allowUnknown:true, query:$q}}')
+    if [[ -z "$variables" ]]; then
+        log "Failed to encode search variables"
+        echo '[]'
+        return 0
+    fi
     
     local response
     if ! response=$(make_graphql_request "$search_query" "$variables"); then
         log "Failed to search anime"
-        return 1
+        echo '[]'
+        return 0
     fi
     
     # Parse response and format for watch-cli with error handling
     local results
-    if ! results=$(echo "$response" | jq -r '
-        .data.shows.edges[] | {
+    if ! results=$(echo "$response" | jq '
+        (.data.shows.edges // []) | map({
             id: ._id,
-            title: (.englishName // .name),
-            year: .year,
+            title: (.englishName // .name // "Unknown"),
+            year: (.year // null),
             thumbnail: .thumbnail,
             episodes: .availableEpisodes,
             status: .status,
             type: .type,
             provider: "allanime"
-        }' | jq -s '.' 2>/dev/null); then
+        })
+    ' 2>/dev/null); then
         log "Failed to parse search results"
-        return 1
+        echo '[]'
+        return 0
     fi
     
-    # Validate results
-    if [[ -z "$results" ]] || [[ "$results" == "null" ]] || [[ "$results" == "[]" ]]; then
-        log "No search results found"
-        return 1
+    if [[ -z "$results" ]] || [[ "$results" == "null" ]]; then
+        echo '[]'
+        return 0
     fi
     
     echo "$results"
@@ -184,31 +192,38 @@ get_episodes() {
     local variables="{\"showId\":\"$anime_id\"}"
     
     local response
-    response=$(make_graphql_request "$episodes_query" "$variables")
-    
-    # Parse episodes
+    if ! response=$(make_graphql_request "$episodes_query" "$variables"); then
+        log "Failed to fetch episodes"
+        echo '[]'
+        return 0
+    fi
+
     local episodes
-    episodes=$(echo "$response" | jq -r '
-        .data.show.availableEpisodes.sub[]? | {
-            episode: (.episodeString | tonumber),
-            title: .notes,
-            type: "sub"
-        }' | jq -s '.')
-    
-    # Add dub episodes if available
-    local dub_episodes
-    dub_episodes=$(echo "$response" | jq -r '
-        .data.show.availableEpisodes.dub[]? | {
-            episode: (.episodeString | tonumber),
-            title: .notes,
-            type: "dub"
-        }' | jq -s '.')
-    
-    # Combine sub and dub episodes
-    local all_episodes
-    all_episodes=$(echo "$episodes $dub_episodes" | jq -s 'add | sort_by(.episode)')
-    
-    echo "$all_episodes"
+    if ! episodes=$(echo "$response" | jq '
+        def episode_num($value):
+            ($value // "")
+            | capture("(?<num>[0-9]+)")?.num
+            | tonumber? // 0;
+
+        (
+            [(.data.show.availableEpisodes.sub // [])[]? | {
+                episode: episode_num(.episodeString),
+                title: (.notes // "Sub"),
+                type: "sub"
+            }] +
+            [(.data.show.availableEpisodes.dub // [])[]? | {
+                episode: episode_num(.episodeString),
+                title: (.notes // "Dub"),
+                type: "dub"
+            }]
+        ) | map(select(.episode > 0)) | sort_by(.episode, .type)
+    ' 2>/dev/null); then
+        log "Failed to parse episode list"
+        echo '[]'
+        return 0
+    fi
+
+    echo "$episodes"
 }
 
 # Get stream URL for an episode
@@ -234,16 +249,21 @@ get_stream_url() {
     local variables="{\"showId\":\"$anime_id\",\"episodeString\":\"$episode\"}"
     
     local response
-    response=$(make_graphql_request "$sources_query" "$variables")
-    
-    # Parse stream URLs and select the best one
+    if ! response=$(make_graphql_request "$sources_query" "$variables"); then
+        log "Failed to fetch stream sources for $anime_id"
+        return 1
+    fi
+
     local stream_url
     stream_url=$(echo "$response" | jq -r '
-        .data.episode.sourceUrls[] | 
-        select(.sourceUrl != null) |
-        .sourceUrl' | head -1)
-    
-    if [[ -z "$stream_url" ]]; then
+        (.data.episode.sourceUrls // [])
+        | sort_by(.priority // 0) | reverse
+        | map(select(.sourceUrl != null))
+        | map(.sourceUrl)
+        | .[0]
+    ' 2>/dev/null)
+
+    if [[ -z "$stream_url" ]] || [[ "$stream_url" == "null" ]]; then
         log "No stream URL found for episode $episode"
         return 1
     fi
@@ -252,17 +272,16 @@ get_stream_url() {
     if [[ "$stream_url" == *"cdn.allanime.co"* ]]; then
         # Try to get the actual video URL from the CDN
         local cdn_response
-        cdn_response=$(curl -s --max-time 30 --connect-timeout 10 \
+        if cdn_response=$(curl -sS --max-time 30 --connect-timeout 10 \
             -H "User-Agent: $USER_AGENT" \
             -H "Referer: https://allanime.co/" \
-            "$stream_url")
-        
-        # Look for video URLs in the response
-        local video_url
-        video_url=$(echo "$cdn_response" | grep -o 'https\?://[^"[:space:]]\+\.\(mp4\|m3u8\|mkv\)' | head -1)
-        
-        if [[ -n "$video_url" ]]; then
-            stream_url="$video_url"
+            "$stream_url" 2>/dev/null); then
+            # Look for video URLs in the response
+            local video_url
+            video_url=$(echo "$cdn_response" | grep -o 'https\?://[^"[:space:]]\+\.(mp4\|m3u8\|mkv)' | head -1)
+            if [[ -n "$video_url" ]]; then
+                stream_url="$video_url"
+            fi
         fi
     fi
     

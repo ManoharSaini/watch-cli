@@ -28,11 +28,14 @@ log() {
 # Get CSRF token
 get_csrf_token() {
     local response
-    response=$(curl -s --max-time 30 --connect-timeout 10 \
+    if ! response=$(curl -sS -f --max-time 30 --connect-timeout 10 \
         -H "User-Agent: $USER_AGENT" \
         -H "Referer: $GOKU_BASE/" \
-        "$GOKU_BASE/")
-    
+        "$GOKU_BASE/" 2>/dev/null); then
+        log "Failed to retrieve CSRF token"
+        return 0
+    fi
+
     echo "$response" | grep -o 'name="csrf-token" content="[^"]*"' | sed 's/name="csrf-token" content="\([^"]*\)"/\1/'
 }
 
@@ -52,16 +55,20 @@ search_goku() {
     
     # Make search request
     local response
-    response=$(curl -s --max-time 30 --connect-timeout 10 \
+    if ! response=$(curl -sS --max-time 30 --connect-timeout 10 \
         -H "User-Agent: $USER_AGENT" \
         -H "Referer: $GOKU_BASE/" \
         -H "X-Requested-With: XMLHttpRequest" \
-        "$search_url")
-    
+        "$search_url" 2>/dev/null); then
+        log "Goku.to search request failed"
+        echo '[]'
+        return 0
+    fi
+
     # Parse search results
     local results
-    results=$(echo "$response" | jq -r '
-        .data[] | {
+    if ! results=$(echo "$response" | jq -r '
+        (.data // [])[] | {
             id: .id,
             title: .title,
             year: (.year | tonumber? // null),
@@ -69,8 +76,12 @@ search_goku() {
             poster: .poster,
             rating: .rating,
             provider: "goku"
-        }' | jq -s '.')
-    
+        }' 2>/dev/null | jq -s '.' 2>/dev/null); then
+        log "Unexpected search response from Goku.to"
+        echo '[]'
+        return 0
+    fi
+
     echo "$results"
 }
 
@@ -83,17 +94,25 @@ get_episodes() {
     # Get show details
     local show_url="${GOKU_BASE}/tv/${show_id}"
     local response
-    response=$(curl -s --max-time 30 --connect-timeout 10 \
+    if ! response=$(curl -sS --max-time 30 --connect-timeout 10 \
         -H "User-Agent: $USER_AGENT" \
         -H "Referer: $GOKU_BASE/" \
-        "$show_url")
-    
+        "$show_url" 2>/dev/null); then
+        log "Failed to fetch Goku.to show page"
+        echo '[]'
+        return 0
+    fi
+
     # Extract episodes from the page
     local episodes
-    episodes=$(echo "$response" | grep -o 'data-id="[^"]*"[^>]*>Episode [0-9]*' | \
+    if ! episodes=$(echo "$response" | grep -o 'data-id="[^"]*"[^>]*>Episode [0-9]*' | \
         sed 's/data-id="\([^"]*\)".*Episode \([0-9]*\)/{"episode": \2, "id": "\1", "title": "Episode \2"}/' | \
-        jq -s '.')
-    
+        jq -s '.' 2>/dev/null); then
+        log "Failed to parse episodes from Goku.to response"
+        echo '[]'
+        return 0
+    fi
+
     echo "$episodes"
 }
 
@@ -111,23 +130,31 @@ get_servers() {
     # Request server list
     local server_url="${GOKU_API}/v2/episode/servers"
     local response
-    response=$(curl -s --max-time 30 --connect-timeout 10 \
+    if ! response=$(curl -sS --max-time 30 --connect-timeout 10 \
         -H "User-Agent: $USER_AGENT" \
         -H "Referer: $GOKU_BASE/" \
         -H "X-Requested-With: XMLHttpRequest" \
         -H "X-CSRF-TOKEN: $csrf_token" \
         -d "id=$content_id&episode=$episode" \
-        "$server_url")
-    
+        "$server_url" 2>/dev/null); then
+        log "Failed to fetch server list from Goku.to"
+        echo '[]'
+        return 0
+    fi
+
     # Parse server list
     local servers
-    servers=$(echo "$response" | jq -r '
-        .data[] | {
+    if ! servers=$(echo "$response" | jq -r '
+        (.data // [])[] | {
             name: .name,
             id: .id,
             priority: .priority
-        }' | jq -s '.')
-    
+        }' 2>/dev/null | jq -s '.' 2>/dev/null); then
+        log "Unexpected server response from Goku.to"
+        echo '[]'
+        return 0
+    fi
+
     echo "$servers"
 }
 
@@ -146,17 +173,20 @@ get_stream_from_server() {
     # Request stream URL
     local stream_url="${GOKU_API}/v2/episode/sources"
     local response
-    response=$(curl -s --max-time 30 --connect-timeout 10 \
+    if ! response=$(curl -sS --max-time 30 --connect-timeout 10 \
         -H "User-Agent: $USER_AGENT" \
         -H "Referer: $GOKU_BASE/" \
         -H "X-Requested-With: XMLHttpRequest" \
         -H "X-CSRF-TOKEN: $csrf_token" \
         -d "id=$content_id&episode=$episode&serverId=$server_id" \
-        "$stream_url")
-    
+        "$stream_url" 2>/dev/null); then
+        log "Failed to fetch stream sources from Goku.to"
+        return 1
+    fi
+
     # Parse stream URL
     local stream
-    stream=$(echo "$response" | jq -r '.data[0].file // empty')
+    stream=$(echo "$response" | jq -r '(.data // [])[] | .file // empty' 2>/dev/null | head -1)
     
     if [[ -n "$stream" ]]; then
         echo "$stream"

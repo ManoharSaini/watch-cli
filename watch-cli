@@ -8,9 +8,12 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="${HOME}/.config/watch-cli"
-CACHE_DIR="${CONFIG_DIR}/cache"
-LOG_FILE="${CONFIG_DIR}/watch-cli.log"
+CONFIG_DIR_DEFAULT="${HOME}/.config/watch-cli"
+CONFIG_DIR="${CONFIG_DIR:-$CONFIG_DIR_DEFAULT}"
+CACHE_DIR_DEFAULT="${CONFIG_DIR}/cache"
+CACHE_DIR="${CACHE_DIR:-$CACHE_DIR_DEFAULT}"
+LOG_FILE_DEFAULT="${CONFIG_DIR}/watch-cli.log"
+LOG_FILE="${LOG_FILE:-$LOG_FILE_DEFAULT}"
 
 # Default configuration
 DEFAULT_PLAYER="mpv"
@@ -57,6 +60,44 @@ print_warning() {
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1" >&2
     log "ERROR: $1"
+}
+
+# Normalize various boolean representations to "true" or "false"
+normalize_bool() {
+    local value="${1:-}"
+    value=$(echo "$value" | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        true|1|yes|y|on)
+            echo "true"
+            ;;
+        false|0|no|n|off)
+            echo "false"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+# Clean up peerflix stream state if present
+cleanup_peerflix_session() {
+    local session_file="${CACHE_DIR}/peerflix.session"
+    if [[ ! -f "$session_file" ]]; then
+        return 0
+    fi
+
+    local peerflix_pid="" tmp_dir="" port=""
+    if read -r peerflix_pid tmp_dir port <"$session_file"; then
+        if [[ -n "$peerflix_pid" ]] && kill -0 "$peerflix_pid" >/dev/null 2>&1; then
+            kill "$peerflix_pid" >/dev/null 2>&1 || true
+            wait "$peerflix_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$tmp_dir" ]]; then
+            rm -rf "$tmp_dir" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    rm -f "$session_file" >/dev/null 2>&1 || true
 }
 
 # Check if a command exists and is functional
@@ -154,78 +195,90 @@ check_dependencies() {
 
 # Initialize configuration
 init_config() {
-    # Create directories with error handling and race condition protection
-    if ! mkdir -p "$CONFIG_DIR" 2>/dev/null; then
-        # Check if directory was created by another process
-        if [[ ! -d "$CONFIG_DIR" ]]; then
-            print_error "Failed to create config directory: $CONFIG_DIR"
-            exit 1
-        fi
+    local config_file="${CONFIG_DIR}/config"
+
+    # Create config directory with error handling
+    if ! mkdir -p "$CONFIG_DIR" 2>/dev/null && [[ ! -d "$CONFIG_DIR" ]]; then
+        print_error "Failed to create config directory: $CONFIG_DIR"
+        exit 1
     fi
-    
-    if ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
-        # Check if directory was created by another process
-        if [[ ! -d "$CACHE_DIR" ]]; then
-            print_error "Failed to create cache directory: $CACHE_DIR"
-            exit 1
-        fi
-    fi
-    
-    # Load user configuration with security validation
-    if [[ -f "${CONFIG_DIR}/config" ]]; then
-        # Validate config file is readable and safe
-        if [[ ! -r "${CONFIG_DIR}/config" ]]; then
-            print_warning "Config file exists but is not readable: ${CONFIG_DIR}/config"
+
+    # Load user configuration
+    if [[ -f "$config_file" ]]; then
+        if [[ ! -r "$config_file" ]]; then
+            print_warning "Config file exists but is not readable: $config_file"
         else
-            # Validate config file doesn't contain dangerous commands
-            if grep -qE '(exec|eval|system|command|`|\$\(|source|\.)' "${CONFIG_DIR}/config" 2>/dev/null; then
-                print_warning "Config file contains potentially dangerous commands, skipping"
-            else
-                # Source config with error handling in a restricted environment
-                (
-                    # Create a safe environment for config loading
-                    unset -f exec eval system command
-                    if ! source "${CONFIG_DIR}/config" 2>/dev/null; then
-                        print_warning "Failed to load config file, using defaults"
-                    fi
-                )
+            # shellcheck disable=SC1090
+            if ! source "$config_file" 2>/dev/null; then
+                print_warning "Failed to load config file, using defaults"
             fi
         fi
     fi
-    
-    # Set player from environment or config with validation
+
+    # Allow config overrides for cache/log locations
+    CACHE_DIR="${CACHE_DIR:-${CONFIG_DIR}/cache}"
+    LOG_FILE="${LOG_FILE:-${CONFIG_DIR}/watch-cli.log}"
+
+    if ! mkdir -p "$CACHE_DIR" 2>/dev/null && [[ ! -d "$CACHE_DIR" ]]; then
+        print_error "Failed to create cache directory: $CACHE_DIR"
+        exit 1
+    fi
+
+    # Apply configuration values with validation
     PLAYER="${WATCH_CLI_PLAYER:-${PLAYER:-$DEFAULT_PLAYER}}"
     QUALITY="${WATCH_CLI_QUALITY:-$DEFAULT_QUALITY}"
     LANGUAGE="${WATCH_CLI_LANGUAGE:-$DEFAULT_LANGUAGE}"
-    
-    # Validate player choice
+
     case "$PLAYER" in
         "mpv"|"vlc")
-            # Valid player
             ;;
         *)
             print_warning "Invalid player '$PLAYER', defaulting to '$DEFAULT_PLAYER'"
             PLAYER="$DEFAULT_PLAYER"
             ;;
     esac
-    
-    # Validate quality
+
     case "$QUALITY" in
         "360p"|"480p"|"720p"|"1080p")
-            # Valid quality
             ;;
         *)
             print_warning "Invalid quality '$QUALITY', defaulting to '$DEFAULT_QUALITY'"
             QUALITY="$DEFAULT_QUALITY"
             ;;
     esac
-    
-    # Validate language (basic check)
+
     if [[ ! "$LANGUAGE" =~ ^[a-z]{2}$ ]]; then
         print_warning "Invalid language format '$LANGUAGE', defaulting to '$DEFAULT_LANGUAGE'"
         LANGUAGE="$DEFAULT_LANGUAGE"
     fi
-    
+
+    local normalized
+    normalized=$(normalize_bool "${ENABLE_TORRENT:-true}")
+    if [[ -z "$normalized" ]]; then
+        print_warning "Invalid ENABLE_TORRENT value '${ENABLE_TORRENT:-}', defaulting to true"
+        ENABLE_TORRENT="true"
+    else
+        ENABLE_TORRENT="$normalized"
+    fi
+
+    for flag in ENABLE_ALLANIME ENABLE_INTERNET_ARCHIVE ENABLE_GOKU ENABLE_PEERFLIX; do
+        local current_value="true"
+        if [[ -n ${!flag+x} ]]; then
+            current_value="${!flag}"
+        fi
+        normalized=$(normalize_bool "$current_value")
+        if [[ -z "$normalized" ]]; then
+            print_warning "Invalid $flag value '$current_value', defaulting to true"
+            printf -v "$flag" "%s" "true"
+        else
+            printf -v "$flag" "%s" "$normalized"
+        fi
+    done
+
+    if [[ "$ENABLE_TORRENT" == "false" ]]; then
+        ENABLE_PEERFLIX="false"
+    fi
+
     print_info "Using player: $PLAYER"
     print_info "Quality preference: $QUALITY"
     print_info "Language preference: $LANGUAGE"
@@ -345,42 +398,112 @@ query_providers() {
     local media_type="$1"
     local query="$2"
     local results_file="${CACHE_DIR}/search_results.json"
-    
-    # Clear previous results
     > "$results_file"
-    
+    local temp_results="${CACHE_DIR}/search_results.tmp"
+    > "$temp_results"
+
     case "$media_type" in
         "anime")
-            # Query anime providers in order
-            if [[ -f "${SCRIPT_DIR}/providers/allanime.sh" ]]; then
-                print_info "Querying AllAnime..."
-                "${SCRIPT_DIR}/providers/allanime.sh" search "$query" >> "$results_file"
+            if [[ "$ENABLE_ALLANIME" == "true" ]]; then
+                local provider_script="${SCRIPT_DIR}/providers/allanime.sh"
+                if [[ -x "$provider_script" ]]; then
+                    print_info "Querying AllAnime..."
+                    local provider_output="[]"
+                    if provider_output=$(CONFIG_DIR="$CONFIG_DIR" CACHE_DIR="$CACHE_DIR" LOG_FILE="$LOG_FILE" "$provider_script" search "$query" 2>/dev/null); then
+                        if [[ -n "$provider_output" ]] && echo "$provider_output" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                            if echo "$provider_output" | jq -e 'length > 0' >/dev/null 2>&1; then
+                                echo "$provider_output" | jq -c '.[]' >> "$temp_results"
+                            fi
+                        else
+                            print_warning "AllAnime returned unexpected data, skipping"
+                        fi
+                    else
+                        print_warning "AllAnime search failed"
+                    fi
+                else
+                    print_warning "AllAnime provider not available"
+                fi
             fi
             ;;
         "movie"|"tv")
-            # Query movie/TV providers in order
-            if [[ -f "${SCRIPT_DIR}/providers/internet_archive.sh" ]]; then
-                print_info "Querying Internet Archive..."
-                "${SCRIPT_DIR}/providers/internet_archive.sh" search "$query" "$media_type" >> "$results_file"
+            if [[ "$ENABLE_INTERNET_ARCHIVE" == "true" ]]; then
+                local provider_script="${SCRIPT_DIR}/providers/internet_archive.sh"
+                if [[ -x "$provider_script" ]]; then
+                    print_info "Querying Internet Archive..."
+                    local provider_output="[]"
+                    if provider_output=$(CONFIG_DIR="$CONFIG_DIR" CACHE_DIR="$CACHE_DIR" LOG_FILE="$LOG_FILE" "$provider_script" search "$query" "$media_type" 2>/dev/null); then
+                        if [[ -n "$provider_output" ]] && echo "$provider_output" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                            if echo "$provider_output" | jq -e 'length > 0' >/dev/null 2>&1; then
+                                echo "$provider_output" | jq -c '.[]' >> "$temp_results"
+                            fi
+                        else
+                            print_warning "Internet Archive returned unexpected data, skipping"
+                        fi
+                    else
+                        print_warning "Internet Archive search failed"
+                    fi
+                else
+                    print_warning "Internet Archive provider not available"
+                fi
             fi
-            
-            if [[ -f "${SCRIPT_DIR}/providers/goku.sh" ]]; then
-                print_info "Querying Goku.to..."
-                "${SCRIPT_DIR}/providers/goku.sh" search "$query" "$media_type" >> "$results_file"
+
+            if [[ "$ENABLE_GOKU" == "true" ]]; then
+                local provider_script="${SCRIPT_DIR}/providers/goku.sh"
+                if [[ -x "$provider_script" ]]; then
+                    print_info "Querying Goku.to..."
+                    local provider_output="[]"
+                    if provider_output=$(CONFIG_DIR="$CONFIG_DIR" CACHE_DIR="$CACHE_DIR" LOG_FILE="$LOG_FILE" "$provider_script" search "$query" "$media_type" 2>/dev/null); then
+                        if [[ -n "$provider_output" ]] && echo "$provider_output" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                            if echo "$provider_output" | jq -e 'length > 0' >/dev/null 2>&1; then
+                                echo "$provider_output" | jq -c '.[]' >> "$temp_results"
+                            fi
+                        else
+                            print_warning "Goku.to returned unexpected data, skipping"
+                        fi
+                    else
+                        print_warning "Goku.to search failed"
+                    fi
+                else
+                    print_warning "Goku.to provider not available"
+                fi
             fi
-            
-            if [[ "${ENABLE_TORRENT:-true}" == "true" ]] && [[ -f "${SCRIPT_DIR}/providers/peerflix.sh" ]]; then
-                print_info "Querying torrent sources..."
-                "${SCRIPT_DIR}/providers/peerflix.sh" search "$query" "$media_type" >> "$results_file"
+
+            if [[ "$ENABLE_PEERFLIX" == "true" ]]; then
+                local provider_script="${SCRIPT_DIR}/providers/peerflix.sh"
+                if [[ -x "$provider_script" ]]; then
+                    print_info "Querying torrent sources..."
+                    local provider_output="[]"
+                    if provider_output=$(CONFIG_DIR="$CONFIG_DIR" CACHE_DIR="$CACHE_DIR" LOG_FILE="$LOG_FILE" "$provider_script" search "$query" "$media_type" 2>/dev/null); then
+                        if [[ -n "$provider_output" ]] && echo "$provider_output" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                            if echo "$provider_output" | jq -e 'length > 0' >/dev/null 2>&1; then
+                                echo "$provider_output" | jq -c '.[]' >> "$temp_results"
+                            fi
+                        else
+                            print_warning "Torrent provider returned unexpected data, skipping"
+                        fi
+                    else
+                        print_warning "Torrent search failed"
+                    fi
+                else
+                    print_warning "Torrent provider not available"
+                fi
             fi
             ;;
     esac
-    
-    # Check if we got any results
-    if [[ ! -s "$results_file" ]]; then
+
+    if [[ ! -s "$temp_results" ]]; then
+        rm -f "$temp_results"
         print_error "No results found for query: $query"
         exit 1
     fi
+
+    if ! jq -s '.' "$temp_results" > "$results_file" 2>/dev/null; then
+        rm -f "$temp_results"
+        print_error "Failed to aggregate provider results"
+        exit 1
+    fi
+
+    rm -f "$temp_results"
 }
 
 # Display search results and let user select
@@ -454,6 +577,7 @@ select_episode() {
     
     if [[ "$media_type" == "movie" ]]; then
         # Movies don't need episode selection
+        SELECTED_EPISODE='{"episode":1,"title":"Movie"}'
         return 0
     fi
     
@@ -498,7 +622,7 @@ select_episode() {
     fi
     
     # Call provider script with error handling
-    if ! "$provider_script" episodes "$content_id" > "$episodes_file" 2>/dev/null; then
+    if ! CONFIG_DIR="$CONFIG_DIR" CACHE_DIR="$CACHE_DIR" LOG_FILE="$LOG_FILE" "$provider_script" episodes "$content_id" > "$episodes_file" 2>/dev/null; then
         print_error "Provider script failed: $provider_script"
         exit 1
     fi
@@ -510,11 +634,11 @@ select_episode() {
     
     # Display episodes for selection with proper error handling
     local episode_list
-    if ! episode_list=$(jq -r '.[] | "Episode \(.episode // .number): \(.title // "Episode \(.episode // .number)")"' "$episodes_file" 2>/dev/null); then
+    if ! episode_list=$(jq -r 'map(select(.episode != null or .number != null)) | .[] | "Episode \((.episode // .number) // 1): \(.title // "Episode \((.episode // .number) // 1)")"' "$episodes_file" 2>/dev/null); then
         print_error "Failed to parse episodes file"
         exit 1
     fi
-    
+
     if [[ -z "$episode_list" ]]; then
         print_error "No episodes found"
         exit 1
@@ -544,7 +668,7 @@ select_episode() {
     fi
     
     # Find episode details with proper validation
-    if ! SELECTED_EPISODE=$(jq -r ".[] | select(.episode == $episode_num or .number == $episode_num)" "$episodes_file" 2>/dev/null); then
+    if ! SELECTED_EPISODE=$(jq -r --arg ep "$episode_num" '.[] | select(((.episode // .number // "") | tostring) == $ep)' "$episodes_file" 2>/dev/null); then
         print_error "Could not find episode details"
         exit 1
     fi
@@ -575,16 +699,22 @@ play_content() {
     local headers_file="${CACHE_DIR}/headers.txt"
     local provider_script=""
     local episode_num
-    
-    # Extract episode number safely
-    if ! episode_num=$(echo "$episode" | jq -r '.episode // .number' 2>/dev/null); then
-        print_error "Could not extract episode number"
-        exit 1
+
+    # Extract episode number safely when provided
+    if [[ -n "${episode:-}" ]]; then
+        if ! episode_num=$(echo "$episode" | jq -r '(.episode // .number // 1)' 2>/dev/null); then
+            print_error "Could not extract episode number"
+            exit 1
+        fi
     fi
-    
-    if [[ -z "$episode_num" ]] || [[ "$episode_num" == "null" ]]; then
-        print_error "Invalid episode number"
-        exit 1
+
+    if [[ -z "${episode_num:-}" ]] || [[ "$episode_num" == "null" ]]; then
+        if [[ "$media_type" == "movie" ]]; then
+            episode_num="1"
+        else
+            print_error "Invalid episode number"
+            exit 1
+        fi
     fi
     
     # Determine provider script
@@ -617,9 +747,13 @@ play_content() {
         print_error "Provider script not executable: $provider_script"
         exit 1
     fi
+
+    if [[ "$provider" == "peerflix" ]]; then
+        cleanup_peerflix_session
+    fi
     
     # Call provider script to get stream URL
-    if ! stream_url=$("$provider_script" stream "$content_id" "$episode_num" 2>/dev/null); then
+    if ! stream_url=$(CONFIG_DIR="$CONFIG_DIR" CACHE_DIR="$CACHE_DIR" LOG_FILE="$LOG_FILE" "$provider_script" stream "$content_id" "$episode_num" 2>/dev/null); then
         print_error "Provider script failed to get stream URL"
         exit 1
     fi
@@ -713,7 +847,14 @@ play_content() {
     
     # Execute player (exec replaces current process, so no return)
     print_info "Launching player: ${player_cmd[*]}"
-    exec "${player_cmd[@]}"
+    "${player_cmd[@]}"
+    local player_status=$?
+
+    if [[ "$provider" == "peerflix" ]]; then
+        cleanup_peerflix_session
+    fi
+
+    return "$player_status"
 }
 
 # Main function
@@ -763,6 +904,7 @@ main() {
     
     # Initialize
     init_config
+    trap cleanup_peerflix_session EXIT
     check_dependencies
     
     # Main workflow

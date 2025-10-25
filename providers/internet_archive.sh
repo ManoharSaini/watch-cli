@@ -47,14 +47,18 @@ search_archive() {
     
     # Make API request
     local response
-    response=$(curl -s --max-time 30 --connect-timeout 10 \
+    if ! response=$(curl -sS -f --max-time 30 --connect-timeout 10 \
         -H "User-Agent: $USER_AGENT" \
-        "${IA_API}?q=${query// /%20}%20AND%20${search_params// /%20}&output=json&rows=50")
+        "${IA_API}?q=${query// /%20}%20AND%20${search_params// /%20}&output=json&rows=50" 2>/dev/null); then
+        log "Internet Archive search failed"
+        echo '[]'
+        return 0
+    fi
     
     # Parse response
     local results
-    results=$(echo "$response" | jq -r '
-        .response.docs[] | {
+    if ! results=$(echo "$response" | jq '
+        (.response.docs // []) | map({
             id: .identifier,
             title: .title,
             year: (.date | tonumber? // null),
@@ -63,7 +67,12 @@ search_archive() {
             language: .language,
             runtime: .runtime,
             provider: "internet_archive"
-        }' | jq -s '.')
+        })
+    ' 2>/dev/null); then
+        log "Failed to parse Internet Archive results"
+        echo '[]'
+        return 0
+    fi
     
     echo "$results"
 }
@@ -77,24 +86,39 @@ get_episodes() {
     # Get show metadata
     local metadata_url="${IA_BASE}/metadata/${show_id}"
     local metadata
-    metadata=$(curl -s --max-time 30 --connect-timeout 10 \
+    if ! metadata=$(curl -sS -f --max-time 30 --connect-timeout 10 \
         -H "User-Agent: $USER_AGENT" \
-        "$metadata_url")
-    
-    # Extract files that look like episodes
+        "$metadata_url" 2>/dev/null); then
+        log "Failed to fetch metadata for $show_id"
+        echo '[]'
+        return 0
+    fi
+
     local episodes
-    episodes=$(echo "$metadata" | jq -r '
-        .files[] | 
-        select(.name | test("\\.(mp4|avi|mkv|mov|wmv)$"; "i")) |
-        select(.name | test("episode|ep|s[0-9]+e[0-9]+|part"; "i")) |
-        {
-            episode: (.name | capture("episode\\s*(?<ep>[0-9]+)"; "i") | .ep // .name | capture("ep\\s*(?<ep>[0-9]+)"; "i") | .ep // "1" | tonumber),
-            title: .name,
-            url: ("https://archive.org/download/" + .name),
-            size: .size,
-            format: .format
-        }' | jq -s '. | sort_by(.episode)')
-    
+    if ! episodes=$(echo "$metadata" | jq --arg id "$show_id" '
+        (
+            .files // []
+        ) | map(select(.name | test("\\.(mp4|avi|mkv|mov|wmv)$"; "i")))
+          | map({
+                raw_name: .name,
+                episode: ((
+                    (.name | capture("(?i)(?:episode|ep|part)\\s*(?<num>[0-9]+)")?.num) //
+                    (.name | capture("(?i)s[0-9]+e(?<num>[0-9]+)")?.num)
+                ) | tonumber? // 1),
+                title: (.title // .name),
+                size: .size,
+                format: .format
+            })
+          | map(select(.episode > 0))
+          | map(. + {url: ("https://archive.org/download/" + $id + "/" + .raw_name)})
+          | map(del(.raw_name))
+          | sort_by(.episode)
+    ' 2>/dev/null); then
+        log "Failed to parse Internet Archive metadata for $show_id"
+        echo '[]'
+        return 0
+    fi
+
     echo "$episodes"
 }
 
@@ -110,21 +134,23 @@ get_stream_url() {
         # Get the main video file for the item
         local metadata_url="${IA_BASE}/metadata/${item_id}"
         local metadata
-        metadata=$(curl -s --max-time 30 --connect-timeout 10 \
+        if ! metadata=$(curl -sS -f --max-time 30 --connect-timeout 10 \
             -H "User-Agent: $USER_AGENT" \
-            "$metadata_url")
-        
-        # Find the best quality video file
-        local video_url
-        video_url=$(echo "$metadata" | jq -r '
-            .files[] | 
-            select(.name | test("\\.(mp4|avi|mkv|mov|wmv)$"; "i")) |
-            select(.name | test("^[^/]*$")) |  # Main file, not in subdirectory
-            .name' | head -1)
-        
-        if [[ -n "$video_url" ]]; then
-            echo "${IA_BASE}/download/${item_id}/${video_url}"
-            return 0
+            "$metadata_url" 2>/dev/null); then
+            log "Failed to fetch metadata for ${item_id}"
+        else
+            # Find the best quality video file
+            local video_url
+            video_url=$(echo "$metadata" | jq -r '
+                (.files // [])[] |
+                select(.name | test("\\.(mp4|avi|mkv|mov|wmv)$"; "i")) |
+                select(.name | test("^[^/]*$")) |
+                .name' 2>/dev/null | head -1)
+
+            if [[ -n "$video_url" ]]; then
+                echo "${IA_BASE}/download/${item_id}/${video_url}"
+                return 0
+            fi
         fi
     fi
     
@@ -132,9 +158,22 @@ get_stream_url() {
     local episodes
     episodes=$(get_episodes "$item_id")
     
-    local episode_url
-    episode_url=$(echo "$episodes" | jq -r ".[] | select(.episode == $episode) | .url")
-    
+    local episode_url=""
+    local episode_number=""
+    if episode_number=$(echo "$episode" | grep -oE '^[0-9]+' 2>/dev/null); then
+        :
+    else
+        episode_number=""
+    fi
+
+    if [[ -n "$episode_number" ]]; then
+        episode_url=$(echo "$episodes" | jq -r --arg ep "$episode" --argjson num "$episode_number" '
+            .[] | select((.episode | tostring) == $ep or .episode == $num) | .url
+        ' 2>/dev/null | head -1)
+    else
+        episode_url=$(echo "$episodes" | jq -r --arg ep "$episode" '.[] | select((.episode | tostring) == $ep) | .url' 2>/dev/null | head -1)
+    fi
+
     if [[ -n "$episode_url" ]]; then
         echo "$episode_url"
     else
